@@ -1,0 +1,9 @@
+*.parquet
+*.jpg
+*.jpeg
+*.png
+*.pth
+*.pkl
+__pycache__/
+Data/
+*.rar
