@@ -37,6 +37,11 @@ for path in [PARQUET_PATH, IMAGE_DIR, TAXONOMY_PATH]:
 # ── Load & Clean Data ─────────────────────────────────────────────────────────
 print("\n--- Loading data ---")
 df = pd.read_parquet(PARQUET_PATH)
+discovery_df = pd.read_parquet(os.path.join(DATA_DIR.replace("train", ""), "discovery", "discovery.parquet"))
+df = pd.concat([df, discovery_df]).reset_index(drop=True)
+print(f"Combined shape: {df.shape}")
+
+
 
 with open(TAXONOMY_PATH, "r") as f:
     mapping = json.load(f)
