@@ -71,7 +71,7 @@ with open(os.path.join(OUTPUT_DIR, "main_encoder.pkl"), "wb") as f:
 
 # ── Train / Test Split ────────────────────────────────────────────────────────
 train_df, test_df = train_test_split(
-    df, test_size=0.2,
+    df, test_size=0.1,
     stratify=df["category_id"],
     random_state=42
 )
