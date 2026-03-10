@@ -1,14 +1,16 @@
 """
-train_model.py — Model training
-================================
+train_model.py — Hierarchical Classification
+=============================================
+Predicts main category (21 classes) first, then subcategory (190 classes).
+Two-head model with shared EfficientNet-B3 or ViT backbone.
+
 Vast.ai usage:
-    python train_model.py --data_dir /workspace/Data/train --output_dir /workspace/outputs --model efficientnet --phase2_epochs 15
-    python train_model.py --data_dir /workspace/Data/train --output_dir /workspace/outputs --model vit --phase2_epochs 20
+    python train_model.py --data_dir /workspace/Data/train --output_dir /workspace/outputs --model efficientnet
+    python train_model.py --data_dir /workspace/Data/train --output_dir /workspace/outputs --model vit
 """
 
 import os
 import argparse
-import numpy as np
 import torch
 import torch.nn as nn
 from torchvision import models
@@ -17,7 +19,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import f1_score
 
 # ── Argument Parsing ──────────────────────────────────────────────────────────
-
 parser = argparse.ArgumentParser()
 parser.add_argument("--data_dir",      type=str, default="/workspace/Data/train")
 parser.add_argument("--output_dir",    type=str, default="/workspace/outputs")
@@ -27,10 +28,11 @@ parser.add_argument("--num_workers",   type=int, default=4)
 parser.add_argument("--img_size",      type=int, default=224)
 parser.add_argument("--phase1_epochs", type=int, default=8)
 parser.add_argument("--phase2_epochs", type=int, default=20)
-parser.add_argument("--mixup_prob",    type=float, default=0.5)
+parser.add_argument("--main_weight",   type=float, default=0.3,  help="Loss weight for main category head")
+parser.add_argument("--sub_weight",    type=float, default=0.7,  help="Loss weight for subcategory head")
 args = parser.parse_args()
 
-# ── Pass args to dataset.py via environment variables ────────────────────────
+# Pass args to dataset.py via environment variables
 os.environ["DATA_DIR"]    = args.data_dir
 os.environ["OUTPUT_DIR"]  = args.output_dir
 os.environ["BATCH_SIZE"]  = str(args.batch_size)
@@ -40,10 +42,8 @@ os.environ["IMG_SIZE"]    = str(args.img_size)
 # ── Import dataset ────────────────────────────────────────────────────────────
 from dataset import (
     train_df, test_df, IMAGE_DIR,
-    NUM_CLASSES, cat_encoder,
+    NUM_CLASSES, NUM_MAIN,
     train_loader, test_loader,
-    mixup_batch, mixup_criterion,
-    cutmix_batch
 )
 
 os.makedirs(args.output_dir, exist_ok=True)
@@ -53,128 +53,159 @@ print(f"\nDevice: {device}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-# ── Model ─────────────────────────────────────────────────────────────────────
+# ── Hierarchical Model ────────────────────────────────────────────────────────
+print(f"\n--- Building Hierarchical {args.model} ---")
+print(f"Main categories: {NUM_MAIN} | Subcategories: {NUM_CLASSES}")
 
-print(f"\n--- Building {args.model} for {NUM_CLASSES} classes ---")
+if args.model == "efficientnet":
+    backbone     = models.efficientnet_b3(weights="IMAGENET1K_V1")
+    feature_dim  = backbone.classifier[1].in_features
+    backbone.classifier = nn.Identity()  # remove original classifier
 
-if args.model == "vit":
-    vit       = models.vit_b_16(weights="IMAGENET1K_V1")
-    vit.heads = nn.Identity()
+elif args.model == "vit":
+    backbone     = models.vit_b_16(weights="IMAGENET1K_V1")
+    feature_dim  = 768
+    backbone.heads = nn.Identity()
 
-    class ViTCategory(nn.Module):
-        def __init__(self, backbone):
-            super().__init__()
-            self.backbone      = backbone
-            self.dropout       = nn.Dropout(0.1)
-            self.category_head = nn.Linear(768, NUM_CLASSES)
+class HierarchicalModel(nn.Module):
+    def __init__(self, backbone, feature_dim, num_main, num_sub):
+        super().__init__()
+        self.backbone = backbone
+        self.dropout  = nn.Dropout(0.3)
 
-        def forward(self, x):
-            return self.category_head(self.dropout(self.backbone(x)))
+        # Main category head (21 classes)
+        self.main_head = nn.Sequential(
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_main)
+        )
 
-    model    = ViTCategory(vit).to(device)
-    ckpt_path = os.path.join(args.output_dir, "vit_best.pth")
-    backbone  = model.backbone
-    head      = model.category_head
+        # Subcategory head (190 classes)
+        # Takes features + main category logits as extra signal
+        self.sub_head = nn.Sequential(
+            nn.Linear(feature_dim + num_main, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, num_sub)
+        )
 
-else:
-    efficientnet = models.efficientnet_b3(weights="IMAGENET1K_V1")
-    efficientnet.classifier[1] = nn.Linear(efficientnet.classifier[1].in_features, NUM_CLASSES)
-    model     = efficientnet.to(device)
-    ckpt_path = os.path.join(args.output_dir, "efficientnet_b3_best.pth")
-    backbone  = model.features
-    head      = model.classifier
+    def forward(self, x):
+        features   = self.dropout(self.backbone(x))        # shared features
+        main_logits = self.main_head(features)              # predict main category
+        # Concatenate features with main logits to inform subcategory prediction
+        sub_input  = torch.cat([features, main_logits], dim=1)
+        sub_logits = self.sub_head(sub_input)               # predict subcategory
+        return main_logits, sub_logits
 
-# ── Training Function ─────────────────────────────────────────────────────────
+model     = HierarchicalModel(backbone, feature_dim, NUM_MAIN, NUM_CLASSES).to(device)
+ckpt_path = os.path.join(args.output_dir, f"hierarchical_{args.model}_best.pth")
 
-criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+# ── Loss & Training ───────────────────────────────────────────────────────────
+main_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+sub_criterion  = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-def train_epoch(model, loader, optimizer, use_augmix=False):
+def train_epoch(model, loader, optimizer):
     model.train()
-    total_loss, correct, total = 0, 0, 0
+    total_loss, main_correct, sub_correct, total = 0, 0, 0, 0
 
-    for images, categories in loader:
-        images     = images.to(device)
-        categories = categories.to(device)
+    for images, main_labels, sub_labels in loader:
+        images      = images.to(device)
+        main_labels = main_labels.to(device)
+        sub_labels  = sub_labels.to(device)
 
-        if use_augmix and np.random.random() < args.mixup_prob:
-            if np.random.random() < 0.5:
-                images, mixed_labels = mixup_batch(images, categories, NUM_CLASSES)
-            else:
-                images, mixed_labels = cutmix_batch(images, categories, NUM_CLASSES)
-            mixed_labels = mixed_labels.to(device)
-            optimizer.zero_grad()
-            cat_out = model(images)
-            loss    = mixup_criterion(cat_out, mixed_labels)
-        else:
-            optimizer.zero_grad()
-            cat_out = model(images)
-            loss    = criterion(cat_out, categories)
+        optimizer.zero_grad()
+        main_logits, sub_logits = model(images)
+
+        main_loss = main_criterion(main_logits, main_labels)
+        sub_loss  = sub_criterion(sub_logits,  sub_labels)
+        loss      = args.main_weight * main_loss + args.sub_weight * sub_loss
 
         loss.backward()
         optimizer.step()
-        total_loss += loss.item()
-        correct    += (cat_out.argmax(1) == categories).sum().item()
-        total      += categories.size(0)
 
-    return total_loss / len(loader), correct / total
+        total_loss   += loss.item()
+        main_correct += (main_logits.argmax(1) == main_labels).sum().item()
+        sub_correct  += (sub_logits.argmax(1) == sub_labels).sum().item()
+        total        += sub_labels.size(0)
 
-# ── Phase 1 ───────────────────────────────────────────────────────────────────
+    return total_loss / len(loader), main_correct / total, sub_correct / total
 
-print("\n--- Phase 1: Head only ---")
-for param in backbone.parameters():
+# ── Phase 1 — Freeze backbone ─────────────────────────────────────────────────
+print("\n--- Phase 1: Heads only ---")
+for param in model.backbone.parameters():
     param.requires_grad = False
 
-optimizer = Adam(head.parameters(), lr=1e-3)
+optimizer = Adam([
+    {"params": model.main_head.parameters(), "lr": 1e-3},
+    {"params": model.sub_head.parameters(),  "lr": 1e-3},
+])
 
 for epoch in range(args.phase1_epochs):
-    loss, acc = train_epoch(model, train_loader, optimizer, use_augmix=False)
-    print(f"Epoch {epoch+1}/{args.phase1_epochs} | Loss: {loss:.4f} | Acc: {acc:.4f}")
+    loss, main_acc, sub_acc = train_epoch(model, train_loader, optimizer)
+    print(f"Epoch {epoch+1}/{args.phase1_epochs} | Loss: {loss:.4f} | Main Acc: {main_acc:.4f} | Sub Acc: {sub_acc:.4f}")
 
-# ── Phase 2 ───────────────────────────────────────────────────────────────────
-
-print("\n--- Phase 2: Full fine-tuning with MixUp + CutMix ---")
-for param in backbone.parameters():
+# ── Phase 2 — Full fine-tuning ────────────────────────────────────────────────
+print("\n--- Phase 2: Full fine-tuning ---")
+for param in model.backbone.parameters():
     param.requires_grad = True
 
 optimizer = Adam([
-    {"params": backbone.parameters(), "lr": 1e-5, "weight_decay": 1e-4},
-    {"params": head.parameters(),     "lr": 1e-4, "weight_decay": 1e-4},
+    {"params": model.backbone.parameters(),  "lr": 1e-5, "weight_decay": 1e-4},
+    {"params": model.main_head.parameters(), "lr": 1e-4, "weight_decay": 1e-4},
+    {"params": model.sub_head.parameters(),  "lr": 1e-4, "weight_decay": 1e-4},
 ])
 
 scheduler = CosineAnnealingLR(optimizer, T_max=args.phase2_epochs)
-best_acc  = 0
+best_sub_acc = 0
 
 for epoch in range(args.phase2_epochs):
-    loss, acc = train_epoch(model, train_loader, optimizer, use_augmix=True)
+    loss, main_acc, sub_acc = train_epoch(model, train_loader, optimizer)
     scheduler.step()
-    print(f"Epoch {epoch+1}/{args.phase2_epochs} | Loss: {loss:.4f} | Acc: {acc:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+    print(f"Epoch {epoch+1}/{args.phase2_epochs} | Loss: {loss:.4f} | Main Acc: {main_acc:.4f} | Sub Acc: {sub_acc:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
 
-    if acc > best_acc:
-        best_acc = acc
+    if sub_acc > best_sub_acc:
+        best_sub_acc = sub_acc
         torch.save(model.state_dict(), ckpt_path)
-        print(f"  -> Saved best model ({best_acc:.4f})")
+        print(f"  -> Saved best model (Sub Acc: {best_sub_acc:.4f})")
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
-
 print("\n--- Evaluating on test set ---")
 model.load_state_dict(torch.load(ckpt_path))
 model.eval()
 
-correct, all_preds, all_labels = 0, [], []
+main_correct, sub_correct = 0, 0
 total = len(test_loader.dataset)
+all_sub_preds, all_sub_labels = [], []
+all_main_preds, all_main_labels = [], []
 
 with torch.no_grad():
-    for images, categories in test_loader:
-        images     = images.to(device)
-        categories = categories.to(device)
-        preds      = model(images).argmax(1)
-        correct   += (preds == categories).sum().item()
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(categories.cpu().numpy())
+    for images, main_labels, sub_labels in test_loader:
+        images      = images.to(device)
+        main_labels = main_labels.to(device)
+        sub_labels  = sub_labels.to(device)
 
-print(f"Test Accuracy:   {correct/total:.4f}")
-print(f"Train Accuracy:  {best_acc:.4f}")
-print(f"Overfitting gap: {best_acc - correct/total:.4f}")
-print(f"F1 Macro:        {f1_score(all_labels, all_preds, average='macro'):.4f}")
-print(f"F1 Weighted:     {f1_score(all_labels, all_preds, average='weighted'):.4f}")
+        main_logits, sub_logits = model(images)
+
+        main_preds = main_logits.argmax(1)
+        sub_preds  = sub_logits.argmax(1)
+
+        main_correct += (main_preds == main_labels).sum().item()
+        sub_correct  += (sub_preds  == sub_labels).sum().item()
+
+        all_main_preds.extend(main_preds.cpu().numpy())
+        all_main_labels.extend(main_labels.cpu().numpy())
+        all_sub_preds.extend(sub_preds.cpu().numpy())
+        all_sub_labels.extend(sub_labels.cpu().numpy())
+
+print(f"\n--- Main Category (21 classes) ---")
+print(f"Test Accuracy: {main_correct/total:.4f}")
+print(f"F1 Macro:      {f1_score(all_main_labels, all_main_preds, average='macro'):.4f}")
+
+print(f"\n--- Subcategory (190 classes) ---")
+print(f"Test Accuracy:   {sub_correct/total:.4f}")
+print(f"Train Accuracy:  {best_sub_acc:.4f}")
+print(f"Overfitting gap: {best_sub_acc - sub_correct/total:.4f}")
+print(f"F1 Macro:        {f1_score(all_sub_labels, all_sub_preds, average='macro'):.4f}")
+print(f"F1 Weighted:     {f1_score(all_sub_labels, all_sub_preds, average='weighted'):.4f}")
 print("\nDone.")

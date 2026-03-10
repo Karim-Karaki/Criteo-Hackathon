@@ -1,5 +1,5 @@
 """
-dataset.py — Data loading, augmentation, and splitting
+dataset.py — Hierarchical Data loading, augmentation, and splitting
 Imported by train_model.py — do not run directly.
 """
 
@@ -15,9 +15,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from PIL import Image
 
-# ── These are set by train_model.py before importing this file ────────────────
-# DATA_DIR, OUTPUT_DIR, BATCH_SIZE, NUM_WORKERS, IMG_SIZE
-
+# ── Config from environment variables ────────────────────────────────────────
 DATA_DIR    = os.environ.get("DATA_DIR",    "/workspace/Data/train")
 OUTPUT_DIR  = os.environ.get("OUTPUT_DIR",  "/workspace/outputs")
 BATCH_SIZE  = int(os.environ.get("BATCH_SIZE",  "64"))
@@ -27,7 +25,6 @@ IMG_SIZE    = int(os.environ.get("IMG_SIZE",     "224"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-
 PARQUET_PATH  = os.path.join(DATA_DIR, "train.parquet")
 IMAGE_DIR     = os.path.join(DATA_DIR, "images")
 TAXONOMY_PATH = os.path.join(DATA_DIR, "level2_categories.json")
@@ -38,7 +35,6 @@ for path in [PARQUET_PATH, IMAGE_DIR, TAXONOMY_PATH]:
     print(f"OK {path}")
 
 # ── Load & Clean Data ─────────────────────────────────────────────────────────
-
 print("\n--- Loading data ---")
 df = pd.read_parquet(PARQUET_PATH)
 
@@ -51,21 +47,29 @@ df[["category", "subcategory"]] = df["category_name"].str.split(" > ", expand=Tr
 
 # Merge class 44 into class 28
 df.loc[df["category_id"] == 44, "category_id"] = 28
-print(f"Shape: {df.shape} | Classes: {df['category_id'].nunique()}")
+print(f"Shape: {df.shape} | Subcategories: {df['category_id'].nunique()} | Main categories: {df['category'].nunique()}")
 
 # ── Label Encoding ────────────────────────────────────────────────────────────
 
+# Main category encoder (21 classes)
+main_encoder = LabelEncoder()
+df["main_encoded"] = main_encoder.fit_transform(df["category"])
+
+# Subcategory encoder (190 classes)
 cat_encoder = LabelEncoder()
 df["category_encoded"] = cat_encoder.fit_transform(df["category_id"])
 
+NUM_MAIN    = int(df["main_encoded"].nunique())
+NUM_CLASSES = int(df["category_encoded"].nunique())
+print(f"Main categories: {NUM_MAIN} | Subcategories: {NUM_CLASSES}")
+
+# Save encoders
 with open(os.path.join(OUTPUT_DIR, "category_encoder.pkl"), "wb") as f:
     pickle.dump(cat_encoder, f)
-
-NUM_CLASSES = int(df["category_encoded"].nunique())
-print(f"Classes: {NUM_CLASSES}")
+with open(os.path.join(OUTPUT_DIR, "main_encoder.pkl"), "wb") as f:
+    pickle.dump(main_encoder, f)
 
 # ── Train / Test Split ────────────────────────────────────────────────────────
-
 train_df, test_df = train_test_split(
     df, test_size=0.2,
     stratify=df["category_id"],
@@ -76,15 +80,12 @@ test_df  = test_df.reset_index(drop=True)
 print(f"Train: {len(train_df)} | Test: {len(test_df)}")
 
 # ── Transforms ────────────────────────────────────────────────────────────────
-
 train_transforms = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(15),
-    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.1),
-    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.8, 1.0)),
-    transforms.RandomGrayscale(p=0.1),
-    transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.85, 1.0)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
@@ -96,7 +97,6 @@ test_transforms = transforms.Compose([
 ])
 
 # ── Dataset Class ─────────────────────────────────────────────────────────────
-
 class ProductDataset(Dataset):
     def __init__(self, df, image_dir, transform=None):
         self.df        = df.reset_index(drop=True)
@@ -112,59 +112,31 @@ class ProductDataset(Dataset):
         image    = Image.open(img_path).convert("RGB")
         if self.transform:
             image = self.transform(image)
-        return image, int(row["category_encoded"])
+        return (
+            image,
+            int(row["main_encoded"]),      # main category label (0-20)
+            int(row["category_encoded"])   # subcategory label (0-189)
+        )
 
-# ── MixUp ─────────────────────────────────────────────────────────────────────
-
-def mixup_batch(images, labels, num_classes, alpha=0.4):
-    lam      = np.random.beta(alpha, alpha)
-    index    = torch.randperm(images.size(0))
-    mixed    = lam * images + (1 - lam) * images[index]
-    labels_a = torch.zeros(images.size(0), num_classes).to(labels.device).scatter_(1, labels.view(-1, 1), 1)
-    labels_b = torch.zeros(images.size(0), num_classes).to(labels.device).scatter_(1, labels[index].view(-1, 1), 1)
-    return mixed, lam * labels_a + (1 - lam) * labels_b
-
-
-def mixup_criterion(pred, mixed_labels):
-    log_prob = torch.nn.functional.log_softmax(pred, dim=1)
-    return -(mixed_labels * log_prob).sum(dim=1).mean()
-
-# ── CutMix ────────────────────────────────────────────────────────────────────
-
-def cutmix_batch(images, labels, num_classes, alpha=1.0):
-    lam   = np.random.beta(alpha, alpha)
-    index = torch.randperm(images.size(0))
-    _, _, H, W = images.shape
-    cut_w = int(W * np.sqrt(1.0 - lam))
-    cut_h = int(H * np.sqrt(1.0 - lam))
-    cx, cy = np.random.randint(W), np.random.randint(H)
-    x1 = np.clip(cx - cut_w // 2, 0, W)
-    x2 = np.clip(cx + cut_w // 2, 0, W)
-    y1 = np.clip(cy - cut_h // 2, 0, H)
-    y2 = np.clip(cy + cut_h // 2, 0, H)
-    mixed = images.clone()
-    mixed[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
-    lam      = 1 - ((x2 - x1) * (y2 - y1)) / (W * H)
-    labels_a = torch.zeros(images.size(0), num_classes).to(labels.device).scatter_(1, labels.view(-1, 1), 1)
-    labels_b = torch.zeros(images.size(0), num_classes).to(labels.device).scatter_(1, labels[index].view(-1, 1), 1)
-    return mixed, lam * labels_a + (1 - lam) * labels_b
 # ── DataLoaders ───────────────────────────────────────────────────────────────
-
 def get_loaders(train_df, test_df, image_dir, batch_size, num_workers):
     train_dataset  = ProductDataset(train_df, image_dir, transform=train_transforms)
     test_dataset   = ProductDataset(test_df,  image_dir, transform=test_transforms)
+
+    # Weight by subcategory to balance rare classes
     class_counts   = train_df["category_encoded"].value_counts().sort_index()
     weights        = 1.0 / class_counts
     sample_weights = train_df["category_encoded"].map(weights).values.copy()
     sampler        = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
-    train_loader   = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True)
-    test_loader    = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False,   num_workers=num_workers, pin_memory=True)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True)
+    test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False,   num_workers=num_workers, pin_memory=True)
     return train_loader, test_loader
 
 train_loader, test_loader = get_loaders(train_df, test_df, IMAGE_DIR, BATCH_SIZE, NUM_WORKERS)
 
-images, categories = next(iter(train_loader))
-print(f"\nBatch shape:    {images.shape}")
-print(f"Category range: {categories.min()}-{categories.max()}")
-print(f"NUM_CLASSES:    {NUM_CLASSES}")
+images, main_labels, sub_labels = next(iter(train_loader))
+print(f"\nBatch shape:       {images.shape}")
+print(f"Main label range:  {main_labels.min()}-{main_labels.max()} ({NUM_MAIN} classes)")
+print(f"Sub label range:   {sub_labels.min()}-{sub_labels.max()} ({NUM_CLASSES} classes)")
 print("dataset.py loaded successfully.")
