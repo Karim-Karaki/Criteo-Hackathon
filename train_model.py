@@ -1,6 +1,6 @@
 """
-train_model.py — Hierarchical Classification with Class-Weighted Loss
-=====================================================================
+train_model.py — Hierarchical Classification with Class-Weighted Loss + Early Stopping
+=======================================================================================
 Vast.ai usage:
     python train_model.py --data_dir /workspace/Data/train --output_dir /workspace/outputs --model efficientnet
     python train_model.py --data_dir /workspace/Data/train --output_dir /workspace/outputs --model vit
@@ -10,7 +10,6 @@ import os
 import argparse
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import models
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -24,10 +23,12 @@ parser.add_argument("--model",         type=str, default="efficientnet", choices
 parser.add_argument("--batch_size",    type=int, default=64)
 parser.add_argument("--num_workers",   type=int, default=4)
 parser.add_argument("--img_size",      type=int, default=224)
-parser.add_argument("--phase1_epochs", type=int, default=5)
-parser.add_argument("--phase2_epochs", type=int, default=15)
+parser.add_argument("--phase1_epochs", type=int, default=8)
+parser.add_argument("--phase2_epochs", type=int, default=20)
 parser.add_argument("--main_weight",   type=float, default=0.3)
 parser.add_argument("--sub_weight",    type=float, default=0.7)
+parser.add_argument("--patience",      type=int,   default=5)
+parser.add_argument("--min_delta",     type=float, default=0.001)
 args = parser.parse_args()
 
 os.environ["DATA_DIR"]    = args.data_dir
@@ -49,14 +50,30 @@ print(f"\nDevice: {device}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-# ── Class Weighted Loss ───────────────────────────────────────────────────────
-# Subcategory weights — rare classes get penalized more when wrong
-sub_counts  = train_df["category_encoded"].value_counts().sort_index()
-sub_weights = 1.0 / torch.tensor(sub_counts.values, dtype=torch.float)
-sub_weights = sub_weights / sub_weights.sum() * NUM_CLASSES  # normalize
-sub_weights = sub_weights.to(device)
+# ── Early Stopping ────────────────────────────────────────────────────────────
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0.001):
+        self.patience  = patience
+        self.min_delta = min_delta
+        self.counter   = 0
+        self.best_acc  = 0
 
-# Main category weights
+    def step(self, acc):
+        if acc > self.best_acc + self.min_delta:
+            self.best_acc = acc
+            self.counter  = 0
+            return False
+        else:
+            self.counter += 1
+            print(f"  Early stopping counter: {self.counter}/{self.patience}")
+            return self.counter >= self.patience
+
+# ── Class Weighted Loss ───────────────────────────────────────────────────────
+sub_counts   = train_df["category_encoded"].value_counts().sort_index()
+sub_weights  = 1.0 / torch.tensor(sub_counts.values, dtype=torch.float)
+sub_weights  = sub_weights / sub_weights.sum() * NUM_CLASSES
+sub_weights  = sub_weights.to(device)
+
 main_counts  = train_df["main_encoded"].value_counts().sort_index()
 main_weights = 1.0 / torch.tensor(main_counts.values, dtype=torch.float)
 main_weights = main_weights / main_weights.sum() * NUM_MAIN
@@ -65,11 +82,10 @@ main_weights = main_weights.to(device)
 main_criterion = nn.CrossEntropyLoss(weight=main_weights, label_smoothing=0.1)
 sub_criterion  = nn.CrossEntropyLoss(weight=sub_weights,  label_smoothing=0.1)
 
-print(f"Class weights applied — Sub min: {sub_weights.min():.4f} | max: {sub_weights.max():.4f}")
+print(f"Class weights — Sub min: {sub_weights.min():.4f} | max: {sub_weights.max():.4f}")
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 print(f"\n--- Building Hierarchical {args.model} ---")
-print(f"Main categories: {NUM_MAIN} | Subcategories: {NUM_CLASSES}")
 
 if args.model == "efficientnet":
     backbone    = models.efficientnet_b3(weights="IMAGENET1K_V1")
@@ -87,7 +103,6 @@ class HierarchicalModel(nn.Module):
         self.backbone = backbone
         self.dropout  = nn.Dropout(0.3)
 
-        # Main category head (21 classes)
         self.main_head = nn.Sequential(
             nn.Linear(feature_dim, 256),
             nn.ReLU(),
@@ -95,7 +110,6 @@ class HierarchicalModel(nn.Module):
             nn.Linear(256, num_main)
         )
 
-        # Subcategory head — features + main logits concatenated
         self.sub_head = nn.Sequential(
             nn.Linear(feature_dim + num_main, 512),
             nn.ReLU(),
@@ -165,8 +179,9 @@ optimizer = Adam([
     {"params": model.sub_head.parameters(),  "lr": 1e-4, "weight_decay": 1e-4},
 ])
 
-scheduler    = CosineAnnealingLR(optimizer, T_max=args.phase2_epochs)
-best_sub_acc = 0
+scheduler      = CosineAnnealingLR(optimizer, T_max=args.phase2_epochs)
+best_sub_acc   = 0
+early_stopping = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
 
 for epoch in range(args.phase2_epochs):
     loss, main_acc, sub_acc = train_epoch(model, train_loader, optimizer)
@@ -178,15 +193,19 @@ for epoch in range(args.phase2_epochs):
         torch.save(model.state_dict(), ckpt_path)
         print(f"  -> Saved best model (Sub Acc: {best_sub_acc:.4f})")
 
+    if early_stopping.step(sub_acc):
+        print("Early stopping triggered.")
+        break
+
 # ── Evaluation ────────────────────────────────────────────────────────────────
 print("\n--- Evaluating on test set ---")
 model.load_state_dict(torch.load(ckpt_path))
 model.eval()
 
-main_correct, sub_correct         = 0, 0
-total                             = len(test_loader.dataset)
-all_sub_preds,  all_sub_labels    = [], []
-all_main_preds, all_main_labels   = [], []
+main_correct, sub_correct       = 0, 0
+total                           = len(test_loader.dataset)
+all_sub_preds,  all_sub_labels  = [], []
+all_main_preds, all_main_labels = [], []
 
 with torch.no_grad():
     for images, main_labels, sub_labels in test_loader:
@@ -195,7 +214,6 @@ with torch.no_grad():
         sub_labels  = sub_labels.to(device)
 
         main_logits, sub_logits = model(images)
-
         main_preds = main_logits.argmax(1)
         sub_preds  = sub_logits.argmax(1)
 
