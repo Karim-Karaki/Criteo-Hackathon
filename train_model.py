@@ -1,9 +1,6 @@
 """
-train_model.py — Hierarchical Classification with Teacher Forcing
-=================================================================
-During training: subcategory head sees TRUE main category label (teacher forcing)
-At inference:    subcategory head sees PREDICTED main category label
-
+train_model.py — Hierarchical Classification with Class-Weighted Loss
+=====================================================================
 Vast.ai usage:
     python train_model.py --data_dir /workspace/Data/train --output_dir /workspace/outputs --model efficientnet
     python train_model.py --data_dir /workspace/Data/train --output_dir /workspace/outputs --model vit
@@ -52,8 +49,26 @@ print(f"\nDevice: {device}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
+# ── Class Weighted Loss ───────────────────────────────────────────────────────
+# Subcategory weights — rare classes get penalized more when wrong
+sub_counts  = train_df["category_encoded"].value_counts().sort_index()
+sub_weights = 1.0 / torch.tensor(sub_counts.values, dtype=torch.float)
+sub_weights = sub_weights / sub_weights.sum() * NUM_CLASSES  # normalize
+sub_weights = sub_weights.to(device)
+
+# Main category weights
+main_counts  = train_df["main_encoded"].value_counts().sort_index()
+main_weights = 1.0 / torch.tensor(main_counts.values, dtype=torch.float)
+main_weights = main_weights / main_weights.sum() * NUM_MAIN
+main_weights = main_weights.to(device)
+
+main_criterion = nn.CrossEntropyLoss(weight=main_weights, label_smoothing=0.1)
+sub_criterion  = nn.CrossEntropyLoss(weight=sub_weights,  label_smoothing=0.1)
+
+print(f"Class weights applied — Sub min: {sub_weights.min():.4f} | max: {sub_weights.max():.4f}")
+
 # ── Model ─────────────────────────────────────────────────────────────────────
-print(f"\n--- Building Hierarchical {args.model} with Teacher Forcing ---")
+print(f"\n--- Building Hierarchical {args.model} ---")
 print(f"Main categories: {NUM_MAIN} | Subcategories: {NUM_CLASSES}")
 
 if args.model == "efficientnet":
@@ -69,9 +84,8 @@ elif args.model == "vit":
 class HierarchicalModel(nn.Module):
     def __init__(self, backbone, feature_dim, num_main, num_sub):
         super().__init__()
-        self.backbone  = backbone
-        self.num_main  = num_main
-        self.dropout   = nn.Dropout(0.3)
+        self.backbone = backbone
+        self.dropout  = nn.Dropout(0.3)
 
         # Main category head (21 classes)
         self.main_head = nn.Sequential(
@@ -81,7 +95,7 @@ class HierarchicalModel(nn.Module):
             nn.Linear(256, num_main)
         )
 
-        # Subcategory head — takes features + one-hot main category
+        # Subcategory head — features + main logits concatenated
         self.sub_head = nn.Sequential(
             nn.Linear(feature_dim + num_main, 512),
             nn.ReLU(),
@@ -89,28 +103,15 @@ class HierarchicalModel(nn.Module):
             nn.Linear(512, num_sub)
         )
 
-    def forward(self, x, main_labels=None):
+    def forward(self, x):
         features    = self.dropout(self.backbone(x))
         main_logits = self.main_head(features)
-
-        if main_labels is not None:
-            # Teacher forcing — use ground truth main label as one-hot
-            main_signal = F.one_hot(main_labels, num_classes=self.num_main).float()
-        else:
-            # Inference — use predicted main label as one-hot
-            main_pred   = main_logits.argmax(1)
-            main_signal = F.one_hot(main_pred, num_classes=self.num_main).float()
-
-        sub_input  = torch.cat([features, main_signal], dim=1)
-        sub_logits = self.sub_head(sub_input)
+        sub_input   = torch.cat([features, main_logits], dim=1)
+        sub_logits  = self.sub_head(sub_input)
         return main_logits, sub_logits
 
 model     = HierarchicalModel(backbone, feature_dim, NUM_MAIN, NUM_CLASSES).to(device)
 ckpt_path = os.path.join(args.output_dir, f"hierarchical_{args.model}_best.pth")
-
-# ── Loss ──────────────────────────────────────────────────────────────────────
-main_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-sub_criterion  = nn.CrossEntropyLoss(label_smoothing=0.1)
 
 # ── Training Function ─────────────────────────────────────────────────────────
 def train_epoch(model, loader, optimizer):
@@ -123,8 +124,7 @@ def train_epoch(model, loader, optimizer):
         sub_labels  = sub_labels.to(device)
 
         optimizer.zero_grad()
-        # Pass true main labels — teacher forcing
-        main_logits, sub_logits = model(images, main_labels=main_labels)
+        main_logits, sub_logits = model(images)
 
         main_loss = main_criterion(main_logits, main_labels)
         sub_loss  = sub_criterion(sub_logits,  sub_labels)
@@ -183,9 +183,9 @@ print("\n--- Evaluating on test set ---")
 model.load_state_dict(torch.load(ckpt_path))
 model.eval()
 
-main_correct, sub_correct   = 0, 0
-total                        = len(test_loader.dataset)
-all_sub_preds, all_sub_labels     = [], []
+main_correct, sub_correct         = 0, 0
+total                             = len(test_loader.dataset)
+all_sub_preds,  all_sub_labels    = [], []
 all_main_preds, all_main_labels   = [], []
 
 with torch.no_grad():
@@ -194,8 +194,7 @@ with torch.no_grad():
         main_labels = main_labels.to(device)
         sub_labels  = sub_labels.to(device)
 
-        # No teacher forcing at inference — model uses its own main prediction
-        main_logits, sub_logits = model(images, main_labels=None)
+        main_logits, sub_logits = model(images)
 
         main_preds = main_logits.argmax(1)
         sub_preds  = sub_logits.argmax(1)
