@@ -120,9 +120,10 @@ def mixup_batch(images, labels, num_classes, alpha=0.4):
     lam      = np.random.beta(alpha, alpha)
     index    = torch.randperm(images.size(0))
     mixed    = lam * images + (1 - lam) * images[index]
-    labels_a = torch.zeros(images.size(0), num_classes).scatter_(1, labels.view(-1, 1), 1)
-    labels_b = torch.zeros(images.size(0), num_classes).scatter_(1, labels[index].view(-1, 1), 1)
+    labels_a = torch.zeros(images.size(0), num_classes).to(labels.device).scatter_(1, labels.view(-1, 1), 1)
+    labels_b = torch.zeros(images.size(0), num_classes).to(labels.device).scatter_(1, labels[index].view(-1, 1), 1)
     return mixed, lam * labels_a + (1 - lam) * labels_b
+
 
 def mixup_criterion(pred, mixed_labels):
     log_prob = torch.nn.functional.log_softmax(pred, dim=1)
@@ -144,10 +145,9 @@ def cutmix_batch(images, labels, num_classes, alpha=1.0):
     mixed = images.clone()
     mixed[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
     lam      = 1 - ((x2 - x1) * (y2 - y1)) / (W * H)
-    labels_a = torch.zeros(images.size(0), num_classes).scatter_(1, labels.view(-1, 1), 1)
-    labels_b = torch.zeros(images.size(0), num_classes).scatter_(1, labels[index].view(-1, 1), 1)
+    labels_a = torch.zeros(images.size(0), num_classes).to(labels.device).scatter_(1, labels.view(-1, 1), 1)
+    labels_b = torch.zeros(images.size(0), num_classes).to(labels.device).scatter_(1, labels[index].view(-1, 1), 1)
     return mixed, lam * labels_a + (1 - lam) * labels_b
-
 # ── DataLoaders ───────────────────────────────────────────────────────────────
 
 def get_loaders(train_df, test_df, image_dir, batch_size, num_workers):
