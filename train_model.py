@@ -1,8 +1,8 @@
 """
-train_model.py — Hierarchical Classification
-=============================================
-Predicts main category (21 classes) first, then subcategory (190 classes).
-Two-head model with shared EfficientNet-B3 or ViT backbone.
+train_model.py — Hierarchical Classification with Teacher Forcing
+=================================================================
+During training: subcategory head sees TRUE main category label (teacher forcing)
+At inference:    subcategory head sees PREDICTED main category label
 
 Vast.ai usage:
     python train_model.py --data_dir /workspace/Data/train --output_dir /workspace/outputs --model efficientnet
@@ -13,6 +13,7 @@ import os
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -26,20 +27,18 @@ parser.add_argument("--model",         type=str, default="efficientnet", choices
 parser.add_argument("--batch_size",    type=int, default=64)
 parser.add_argument("--num_workers",   type=int, default=4)
 parser.add_argument("--img_size",      type=int, default=224)
-parser.add_argument("--phase1_epochs", type=int, default=8)
-parser.add_argument("--phase2_epochs", type=int, default=20)
-parser.add_argument("--main_weight",   type=float, default=0.3,  help="Loss weight for main category head")
-parser.add_argument("--sub_weight",    type=float, default=0.7,  help="Loss weight for subcategory head")
+parser.add_argument("--phase1_epochs", type=int, default=5)
+parser.add_argument("--phase2_epochs", type=int, default=15)
+parser.add_argument("--main_weight",   type=float, default=0.3)
+parser.add_argument("--sub_weight",    type=float, default=0.7)
 args = parser.parse_args()
 
-# Pass args to dataset.py via environment variables
 os.environ["DATA_DIR"]    = args.data_dir
 os.environ["OUTPUT_DIR"]  = args.output_dir
 os.environ["BATCH_SIZE"]  = str(args.batch_size)
 os.environ["NUM_WORKERS"] = str(args.num_workers)
 os.environ["IMG_SIZE"]    = str(args.img_size)
 
-# ── Import dataset ────────────────────────────────────────────────────────────
 from dataset import (
     train_df, test_df, IMAGE_DIR,
     NUM_CLASSES, NUM_MAIN,
@@ -53,25 +52,26 @@ print(f"\nDevice: {device}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-# ── Hierarchical Model ────────────────────────────────────────────────────────
-print(f"\n--- Building Hierarchical {args.model} ---")
+# ── Model ─────────────────────────────────────────────────────────────────────
+print(f"\n--- Building Hierarchical {args.model} with Teacher Forcing ---")
 print(f"Main categories: {NUM_MAIN} | Subcategories: {NUM_CLASSES}")
 
 if args.model == "efficientnet":
-    backbone     = models.efficientnet_b3(weights="IMAGENET1K_V1")
-    feature_dim  = backbone.classifier[1].in_features
-    backbone.classifier = nn.Identity()  # remove original classifier
+    backbone    = models.efficientnet_b3(weights="IMAGENET1K_V1")
+    feature_dim = backbone.classifier[1].in_features
+    backbone.classifier = nn.Identity()
 
 elif args.model == "vit":
-    backbone     = models.vit_b_16(weights="IMAGENET1K_V1")
-    feature_dim  = 768
+    backbone    = models.vit_b_16(weights="IMAGENET1K_V1")
+    feature_dim = 768
     backbone.heads = nn.Identity()
 
 class HierarchicalModel(nn.Module):
     def __init__(self, backbone, feature_dim, num_main, num_sub):
         super().__init__()
-        self.backbone = backbone
-        self.dropout  = nn.Dropout(0.3)
+        self.backbone  = backbone
+        self.num_main  = num_main
+        self.dropout   = nn.Dropout(0.3)
 
         # Main category head (21 classes)
         self.main_head = nn.Sequential(
@@ -81,8 +81,7 @@ class HierarchicalModel(nn.Module):
             nn.Linear(256, num_main)
         )
 
-        # Subcategory head (190 classes)
-        # Takes features + main category logits as extra signal
+        # Subcategory head — takes features + one-hot main category
         self.sub_head = nn.Sequential(
             nn.Linear(feature_dim + num_main, 512),
             nn.ReLU(),
@@ -90,21 +89,30 @@ class HierarchicalModel(nn.Module):
             nn.Linear(512, num_sub)
         )
 
-    def forward(self, x):
-        features   = self.dropout(self.backbone(x))        # shared features
-        main_logits = self.main_head(features)              # predict main category
-        # Concatenate features with main logits to inform subcategory prediction
-        sub_input  = torch.cat([features, main_logits], dim=1)
-        sub_logits = self.sub_head(sub_input)               # predict subcategory
+    def forward(self, x, main_labels=None):
+        features    = self.dropout(self.backbone(x))
+        main_logits = self.main_head(features)
+
+        if main_labels is not None:
+            # Teacher forcing — use ground truth main label as one-hot
+            main_signal = F.one_hot(main_labels, num_classes=self.num_main).float()
+        else:
+            # Inference — use predicted main label as one-hot
+            main_pred   = main_logits.argmax(1)
+            main_signal = F.one_hot(main_pred, num_classes=self.num_main).float()
+
+        sub_input  = torch.cat([features, main_signal], dim=1)
+        sub_logits = self.sub_head(sub_input)
         return main_logits, sub_logits
 
 model     = HierarchicalModel(backbone, feature_dim, NUM_MAIN, NUM_CLASSES).to(device)
 ckpt_path = os.path.join(args.output_dir, f"hierarchical_{args.model}_best.pth")
 
-# ── Loss & Training ───────────────────────────────────────────────────────────
+# ── Loss ──────────────────────────────────────────────────────────────────────
 main_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 sub_criterion  = nn.CrossEntropyLoss(label_smoothing=0.1)
 
+# ── Training Function ─────────────────────────────────────────────────────────
 def train_epoch(model, loader, optimizer):
     model.train()
     total_loss, main_correct, sub_correct, total = 0, 0, 0, 0
@@ -115,7 +123,8 @@ def train_epoch(model, loader, optimizer):
         sub_labels  = sub_labels.to(device)
 
         optimizer.zero_grad()
-        main_logits, sub_logits = model(images)
+        # Pass true main labels — teacher forcing
+        main_logits, sub_logits = model(images, main_labels=main_labels)
 
         main_loss = main_criterion(main_logits, main_labels)
         sub_loss  = sub_criterion(sub_logits,  sub_labels)
@@ -126,7 +135,7 @@ def train_epoch(model, loader, optimizer):
 
         total_loss   += loss.item()
         main_correct += (main_logits.argmax(1) == main_labels).sum().item()
-        sub_correct  += (sub_logits.argmax(1) == sub_labels).sum().item()
+        sub_correct  += (sub_logits.argmax(1)  == sub_labels).sum().item()
         total        += sub_labels.size(0)
 
     return total_loss / len(loader), main_correct / total, sub_correct / total
@@ -156,7 +165,7 @@ optimizer = Adam([
     {"params": model.sub_head.parameters(),  "lr": 1e-4, "weight_decay": 1e-4},
 ])
 
-scheduler = CosineAnnealingLR(optimizer, T_max=args.phase2_epochs)
+scheduler    = CosineAnnealingLR(optimizer, T_max=args.phase2_epochs)
 best_sub_acc = 0
 
 for epoch in range(args.phase2_epochs):
@@ -174,10 +183,10 @@ print("\n--- Evaluating on test set ---")
 model.load_state_dict(torch.load(ckpt_path))
 model.eval()
 
-main_correct, sub_correct = 0, 0
-total = len(test_loader.dataset)
-all_sub_preds, all_sub_labels = [], []
-all_main_preds, all_main_labels = [], []
+main_correct, sub_correct   = 0, 0
+total                        = len(test_loader.dataset)
+all_sub_preds, all_sub_labels     = [], []
+all_main_preds, all_main_labels   = [], []
 
 with torch.no_grad():
     for images, main_labels, sub_labels in test_loader:
@@ -185,7 +194,8 @@ with torch.no_grad():
         main_labels = main_labels.to(device)
         sub_labels  = sub_labels.to(device)
 
-        main_logits, sub_logits = model(images)
+        # No teacher forcing at inference — model uses its own main prediction
+        main_logits, sub_logits = model(images, main_labels=None)
 
         main_preds = main_logits.argmax(1)
         sub_preds  = sub_logits.argmax(1)
