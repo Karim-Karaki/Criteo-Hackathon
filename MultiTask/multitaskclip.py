@@ -42,7 +42,7 @@ os.environ["BATCH_SIZE"]  = str(args.batch_size)
 os.environ["NUM_WORKERS"] = str(args.num_workers)
 os.environ["IMG_SIZE"]    = "224"
 
-from dataset_multitask import (
+from Datasetmultitask import (
     train_df, test_df, IMAGE_DIR,
     NUM_MAIN, NUM_CLASSES, NUM_COLORS, NUM_GENDERS,
     color_encoder, gender_encoder, cat_encoder, main_encoder,
