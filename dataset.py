@@ -25,8 +25,8 @@ IMG_SIZE    = int(os.environ.get("IMG_SIZE",     "224"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-PARQUET_PATH  = os.path.join(DATA_DIR, "train/train.parquet")
-IMAGE_DIR     = os.path.join(DATA_DIR, "train/images")
+PARQUET_PATH  = os.path.join(DATA_DIR, "train.parquet")
+IMAGE_DIR     = os.path.join(DATA_DIR, "images")
 TAXONOMY_PATH = os.path.join(DATA_DIR, "level2_categories.json")
 
 for path in [PARQUET_PATH, IMAGE_DIR, TAXONOMY_PATH]:
