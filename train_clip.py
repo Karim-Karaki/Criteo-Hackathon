@@ -26,7 +26,7 @@ parser.add_argument("--output_dir",    type=str, default="/workspace/outputs")
 parser.add_argument("--batch_size",    type=int, default=64)
 parser.add_argument("--num_workers",   type=int, default=4)
 parser.add_argument("--phase1_epochs", type=int, default=8)
-parser.add_argument("--phase2_epochs", type=int, default=20)
+parser.add_argument("--phase2_epochs", type=int, default=15)
 parser.add_argument("--main_weight",   type=float, default=0.3)
 parser.add_argument("--sub_weight",    type=float, default=0.7)
 parser.add_argument("--patience",      type=int,   default=5)
@@ -154,14 +154,14 @@ class CLIPHierarchicalModel(nn.Module):
         self.main_head = nn.Sequential(
             nn.Linear(feature_dim, 256),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.5),
             nn.Linear(256, num_main)
         )
 
         self.sub_head = nn.Sequential(
             nn.Linear(feature_dim + num_main, 512),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.5),
             nn.Linear(512, num_sub)
         )
 
@@ -221,10 +221,19 @@ for epoch in range(args.phase1_epochs):
 # ── Phase 2 — Full fine-tuning ────────────────────────────────────────────────
 print("\n--- Phase 2: Full fine-tuning ---")
 for param in model.backbone.parameters():
+    param.requires_grad = False  # freeze everything first
+
+for i, layer in enumerate(model.backbone.encoder.layers):
+    if i >= len(model.backbone.encoder.layers) - 3:
+        for param in layer.parameters():
+            param.requires_grad = True
+
+# Always keep the final layer norm unfrozen
+for param in model.backbone.post_layernorm.parameters():
     param.requires_grad = True
 
 optimizer = Adam([
-    {"params": model.backbone.parameters(),  "lr": 1e-5, "weight_decay": 1e-4},
+    {"params": model.backbone.parameters(),  "lr": 1e-5, "weight_decay": 1e-3},
     {"params": model.main_head.parameters(), "lr": 1e-4, "weight_decay": 1e-4},
     {"params": model.sub_head.parameters(),  "lr": 1e-4, "weight_decay": 1e-4},
 ])
