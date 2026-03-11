@@ -16,7 +16,7 @@ from sklearn.model_selection import train_test_split
 from PIL import Image
 
 # ── Config from environment variables ────────────────────────────────────────
-DATA_DIR    = os.environ.get("DATA_DIR",    "/workspace/Data/train")
+DATA_DIR    = os.environ.get("DATA_DIR",    "/workspace/Data/Data/")
 OUTPUT_DIR  = os.environ.get("OUTPUT_DIR",  "/workspace/outputs")
 BATCH_SIZE  = int(os.environ.get("BATCH_SIZE",  "64"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS",  "4"))
@@ -25,8 +25,8 @@ IMG_SIZE    = int(os.environ.get("IMG_SIZE",     "224"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-PARQUET_PATH  = os.path.join(DATA_DIR, "train.parquet")
-IMAGE_DIR     = os.path.join(DATA_DIR, "images")
+PARQUET_PATH  = os.path.join(DATA_DIR, "train/train.parquet")
+IMAGE_DIR     = os.path.join(DATA_DIR, "train/images")
 TAXONOMY_PATH = os.path.join(DATA_DIR, "level2_categories.json")
 
 for path in [PARQUET_PATH, IMAGE_DIR, TAXONOMY_PATH]:
