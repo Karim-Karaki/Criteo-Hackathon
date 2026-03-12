@@ -24,7 +24,9 @@ import pandas as pd
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from transformers import CLIPVisionModel
+from transformers import CLIPVisionModel, CLIPVisionConfig
+from transformers import CLIPModel
+
 import math
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -69,17 +71,9 @@ class ProductDataset(Dataset):
 class CLIPHierarchicalModel(nn.Module):
     def __init__(self, num_main=NUM_MAIN, num_sub=NUM_SUB):
         super().__init__()
-        self.backbone  = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
-        hidden         = self.backbone.config.hidden_size  # 768
-
-        self.main_head = nn.Sequential(
-            nn.Linear(hidden, 512), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(512, num_main)
-        )
-        self.sub_head  = nn.Sequential(
-            nn.Linear(hidden + num_main, 512), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(512, num_sub)
-        )
+        config        = CLIPVisionConfig.from_pretrained("openai/clip-vit-base-patch32")
+        self.backbone = CLIPVisionModel(config)
+        hidden        = config.hidden_size  # 768
 
     def forward(self, x):
         features   = self.backbone(pixel_values=x).pooler_output
@@ -101,8 +95,8 @@ class DINOv2HierarchicalModel(nn.Module):
         hidden        = 768  # DINOv2-Base hidden size
 
         self.main_head = nn.Sequential(
-            nn.Linear(hidden, 512), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(512, num_main)
+            nn.Linear(hidden, 256), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(256, num_main)
         )
         self.sub_head  = nn.Sequential(
             nn.Linear(hidden + num_main, 512), nn.ReLU(), nn.Dropout(0.3),
@@ -122,7 +116,36 @@ class DINOv2HierarchicalModel(nn.Module):
 
 # ── Load model from state dict ─────────────────────────────────────────────────
 def load_clip_model(path, device):
-    model = CLIPHierarchicalModel()
+    from transformers import CLIPVisionModel, CLIPVisionConfig
+
+    class CLIPHierarchicalModelFixed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # Use the inner vision model directly, not the wrapper
+            full_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+            self.backbone = full_model.vision_model
+            self.backbone = full_model.vision_model  # <-- this gives backbone.embeddings keys
+            hidden = 768
+            self.main_head = nn.Sequential(
+                nn.Linear(hidden, 256), nn.ReLU(), nn.Dropout(0.3),
+                nn.Linear(256, NUM_MAIN)
+            )
+            self.sub_head = nn.Sequential(
+                nn.Linear(hidden + NUM_MAIN, 512), nn.ReLU(), nn.Dropout(0.3),
+                nn.Linear(512, NUM_SUB)
+            )
+
+        def forward(self, x):
+            features = self.backbone(pixel_values=x).pooler_output
+            main_logits = self.main_head(features)
+            sub_logits = self.sub_head(torch.cat([features, main_logits], dim=1))
+            return main_logits, sub_logits
+
+        def get_sub_probs(self, x):
+            _, sub_logits = self.forward(x)
+            return F.softmax(sub_logits, dim=1)
+
+    model = CLIPHierarchicalModelFixed()
     state = torch.load(path, map_location='cpu', weights_only=True)
     model.load_state_dict(state)
     model.to(device).eval()
@@ -169,8 +192,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--clip_path",   type=str, required=True)
     parser.add_argument("--dino_path",   type=str, required=True)
-    parser.add_argument("--data_dir",    type=str, default="/workspace/Data/train")
-    parser.add_argument("--output_path", type=str, default="/workspace/outputs/ensemble_predictions.parquet")
+    parser.add_argument("--data_dir",    type=str, default="./Data/train")
+    parser.add_argument("--output_path", type=str, default="./outputs/ensemble_predictions.parquet")
     parser.add_argument("--clip_weight", type=float, default=0.6)
     parser.add_argument("--dino_weight", type=float, default=0.4)
     parser.add_argument("--batch_size",  type=int, default=64)
@@ -227,3 +250,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+"""" 
+python ensemble_inference.py \
+    --clip_path /workspace/outputs/clip_hierarchical_best.pth \
+    --dino_path /workspace/outputs/dino_best.pth \
+    --clip_weight 0.6 \
+    --dino_weight 0.4
+
+"""
